@@ -1,4 +1,5 @@
 # %%
+%matplotlib
 import rclpy
 from rclpy.time import Time
 from rclpy.duration import Duration
@@ -25,7 +26,7 @@ from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions, Stora
 from tf2_ros.buffer import Buffer
 from tf2_msgs.msg import TFMessage
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import TransformStamped, PoseArray, Pose, PoseStamped
+from geometry_msgs.msg import TransformStamped, PoseArray, Pose, PoseStamped, WrenchStamped
 from std_msgs.msg import Header
 import tf2_geometry_msgs.tf2_geometry_msgs
 import transforms3d.affines as affine
@@ -35,7 +36,7 @@ import bisect
 
 PATH_SRC= Path.home() / 'projects/lampo_ws/src/BagFile'
 TEST_TYPE='linear'
-BAG_TO_LOAD='linear'
+BAG_TO_LOAD=TEST_TYPE
 CSV_FILE_TO_LOAD='linear_1_exported_aruco_poses.csv'
 OMRON_URDF_PATH = get_package_share_path('omron_imm_description') / 'urdf' / 'system.urdf.xacro'
 AZRAEL_URDF_PATH = get_package_share_path('azrael_description') / 'urdf' / 'system.urdf.xacro'
@@ -73,7 +74,6 @@ def invert_affine(a: np.ndarray):
 def stamp_to_float(s) -> float:
   return s.sec + s.nanosec * 1e-9
 
-# %%
 # Robot models
 # ----------------------------------------------------------------------
 
@@ -92,24 +92,26 @@ with tempfile.NamedTemporaryFile(mode='w+t', delete=False) as tmp:
 azrael = pinocchio.buildModelFromUrdf(tmp_name)
 azrael_data = pinocchio.Data(azrael)
 
-# %%
 # Get data from bags
 # ------------------------------------------------------------------------
 
 # 2. Create a tf2 buffer (with a cache window you choose)
 # tf_buffer = BufferCore(nanoseconds=60e9) # 60 seconds
 tf_buffer = Buffer(cache_time=Duration(seconds=60))
-bag_paths = [Path() / PATH_SRC / TEST_TYPE / f'{BAG_TO_LOAD}_{idx}' for idx in range(1,2)]
+bag_paths = [Path() / PATH_SRC / TEST_TYPE / f'{BAG_TO_LOAD}_{idx}' for idx in range(5,6)]
 
 omron_jnts: list[dict[str, float]] = []
 azrael_jnts: List[dict[str, float]]= []
 aruco_poses: List[PoseArray] = []
+wrenches: List[dict[str, float]] = []
 
 def process_bag(path: str):
   global df_omron_jnts
   global azrael_jnts
   global aruco_poses
   global tf_buffer
+  global wrenches
+  global path_msgs
 
   storage_opts = StorageOptions(uri=path, storage_id='sqlite3')
   conv_opts    = ConverterOptions(
@@ -127,6 +129,8 @@ def process_bag(path: str):
         '/omron/joint_states',
         '/joint_states',
         '/aruco_poses',
+        '/force_torque_sensor_broadcaster/wrench',
+        '/omron/plan'
     ])
   )
 
@@ -166,9 +170,20 @@ def process_bag(path: str):
       azrael_jnts.append(new_row)
     elif topic == '/aruco_poses':
       aruco_poses.append(msg_obj)
+    elif topic == '/force_torque_sensor_broadcaster/wrench':
+      w = {}
+      w['time'] = stamp_to_float(msg_obj.header.stamp)
+      w['force.x'] =  msg_obj.wrench.force.x
+      w['force.y'] =  msg_obj.wrench.force.y
+      w['force.z'] =  msg_obj.wrench.force.z
+      w['torque.x'] = msg_obj.wrench.torque.x
+      w['torque.y'] = msg_obj.wrench.torque.y
+      w['torque.z'] = msg_obj.wrench.torque.z
+      wrenches.append(w)
+    elif topic == '/omron/plan':
+      path_msgs.append(msg_obj)
 
 
-# %%
 # Get distance from aruco
 # ------------------------------------------------------------------------
 
@@ -186,14 +201,18 @@ ts_azrael_mount_marker.transform.rotation.z = -0.5016744194861883
 ts_azrael_mount_marker.transform.rotation.w = -0.49518861407525405
 tf_buffer.set_transform(ts_azrael_mount_marker, 'script')
 
-fig_aruco, ax_aruco = plt.subplots()
-fig, axs = plt.subplots(3,1,sharex=True)
 
 for bag in bag_paths:
+
+  fig_aruco, ax_aruco = plt.subplots()
+  fig, axs = plt.subplots(3,1,sharex=True)
+  fig_wr, ax_wr = plt.subplots()
 
   omron_jnts = []
   azrael_jnts = []
   aruco_poses = []
+  wrenches = []
+  path_msgs = []
 
   dist_bases = []
   dist_tool = []
@@ -202,10 +221,20 @@ for bag in bag_paths:
   time2 = []
 
   process_bag(str(bag))
+
+
   df_omron_jnts = pd.DataFrame(omron_jnts, columns=['time','omron/joint_1','omron/joint_2','omron/joint_3','omron/joint_4','omron/joint_5','omron/joint_6', 'omron/finger_joint'])
   df_omron_jnts.sort_values(by='time', axis='index')
   df_azrael_jnts = pd.DataFrame(azrael_jnts, columns=['time', 'azrael/shoulder_pan_joint', 'azrael/shoulder_lift_joint', 'azrael/elbow_joint', 'azrael/wrist_1_joint', 'azrael/wrist_2_joint', 'azrael/wrist_3_joint'])
   df_azrael_jnts.sort_values(by='time', axis='index')
+  df_wrench = pd.DataFrame(wrenches, columns=['time', 'force.x', 'force.y', 'force.z', 'torque.x', 'torque.y', 'torque.z'])
+  df_wrench.sort_values(by='time', axis='index')
+
+  # start_path = path_msgs[0].header.stamp.sec + path_msgs[0].header.stamp.nanosec * 1e-9
+
+  # print(start_path - df_wrench['time'][0])
+
+  # df_wrench = df_wrench[df_wrench['time'] > start_path]
 
   tp = tf_buffer.get_latest_common_time('omron/base_footprint', 'camera_color_optical_frame')
   ts_omron_base_camera = tf_buffer.lookup_transform('omron/base_footprint', 'camera_color_optical_frame', tp)
@@ -227,31 +256,31 @@ for bag in bag_paths:
     time.append(stamp_to_float(pa.header.stamp))
 
     ## USE: Forward Kinematics from models
-    # omron_q = df_omron_jnts.loc[df_omron_jnts['time'] >= stamp_to_float(pa.header.stamp), ~df_omron_jnts.columns.isin(['time','omron/finger_joint'])].iloc[0].to_numpy()
-    # pinocchio.forwardKinematics(omron, omron_data, omron_q)
-    # pinocchio.updateFramePlacements(omron, omron_data)
-    # T_omron_base_tool = np.asarray(omron_data.oMf[omron.getFrameId('omron/tcp')])
-    # T_omron_tool_base = invert_affine(T_omron_base_tool)
+    omron_q = df_omron_jnts.loc[df_omron_jnts['time'] >= stamp_to_float(pa.header.stamp), ~df_omron_jnts.columns.isin(['time','omron/finger_joint'])].iloc[0].to_numpy()
+    pinocchio.forwardKinematics(omron, omron_data, omron_q)
+    pinocchio.updateFramePlacements(omron, omron_data)
+    T_omron_base_tool = np.asarray(omron_data.oMf[omron.getFrameId('omron/tcp')])
+    T_omron_tool_base = invert_affine(T_omron_base_tool)
 
-    # azrael_q = df_azrael_jnts.loc[df_azrael_jnts['time'] >= stamp_to_float(pa.header.stamp), df_azrael_jnts.columns != 'time'].iloc[0].to_numpy()
-    # pinocchio.forwardKinematics(azrael, azrael_data, azrael_q)
-    # pinocchio.updateFramePlacements(azrael, azrael_data)
-    # T_azrael_base_tool = np.asarray(azrael_data.oMf[azrael.getFrameId('azrael/tool0')])
+    azrael_q = df_azrael_jnts.loc[df_azrael_jnts['time'] >= stamp_to_float(pa.header.stamp), df_azrael_jnts.columns != 'time'].iloc[0].to_numpy()
+    pinocchio.forwardKinematics(azrael, azrael_data, azrael_q)
+    pinocchio.updateFramePlacements(azrael, azrael_data)
+    T_azrael_base_tool = np.asarray(azrael_data.oMf[azrael.getFrameId('azrael/tool0')])
     ## END
 
     ## USE: tf_tree for respective base-tool
-    try:
-      ts_omron_base_tool = tf_buffer.lookup_transform('omron/base_footprint', 'omron/tcp', Time().from_msg(pa.header.stamp))
-    except:
-      continue
-    T_omron_base_tool = transform_to_affine(ts_omron_base_tool)
-    T_omron_tool_base = invert_affine(T_omron_base_tool)
+    # try:
+    #   ts_omron_base_tool = tf_buffer.lookup_transform('omron/base_footprint', 'omron/tcp', Time().from_msg(pa.header.stamp))
+    # except:
+    #   continue
+    # T_omron_base_tool = transform_to_affine(ts_omron_base_tool)
+    # T_omron_tool_base = invert_affine(T_omron_base_tool)
 
-    try:
-      ts_azrael_base_tool = tf_buffer.lookup_transform('azrael/base_footprint', 'azrael/tool0', Time().from_msg(pa.header.stamp))
-    except:
-      continue
-    T_azrael_base_tool = transform_to_affine(ts_azrael_base_tool)
+    # try:
+    #   ts_azrael_base_tool = tf_buffer.lookup_transform('azrael/base_footprint', 'azrael/tool0', Time().from_msg(pa.header.stamp))
+    # except:
+    #   continue
+    # T_azrael_base_tool = transform_to_affine(ts_azrael_base_tool)
     ## END
 
     ## USE: tf_tree for base-base distance
@@ -310,12 +339,16 @@ for bag in bag_paths:
     time_from_tf = time_from_tf - time_from_tf[0]
     axs[2].plot(time_from_tf, dist_tool_from_tf, label=f'{bag.name}')
 
-axs[0].grid(True)
-axs[1].grid(True)
-axs[2].grid(True)
-axs[0].legend(); axs[0].set_title('Bases')
-axs[1].legend(); axs[1].set_title('Tools (FK)')
-axs[2].legend(); axs[2].set_title('Tools (TF)')
-fig.suptitle('Distances between robots')
+  axs[0].grid(True)
+  axs[1].grid(True)
+  axs[2].grid(True)
+  axs[0].legend(); axs[0].set_title('Bases')
+  axs[1].legend(); axs[1].set_title('Tools (FK)')
+  axs[2].legend(); axs[2].set_title('Tools (TF)')
+  fig.suptitle('Distances between robots')
+
+  df_wrench.plot(x='time',y='force.x', ax=ax_wr, grid=True)
+
+# ['force.x','force.y','force.z']
 print('Plotting...')
 plt.show()
